@@ -1,0 +1,13 @@
+{
+  "name": "agentchattr-remote",
+  "version": "1.0.0",
+  "description": "Remote agent daemon for agentchattr — runs on any device, connects to the hub",
+  "type": "module",
+  "bin": {
+    "agentchattr-remote": "./daemon.js"
+  },
+  "scripts": {
+    "start": "node daemon.js"
+  },
+  "dependencies": {}
+}
