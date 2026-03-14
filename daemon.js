@@ -26,7 +26,9 @@ for (let i = 2; i < process.argv.length; i++) {
 const AGENT_NAME = args.agent || 'remote-agent';
 const HUB_URL = args.hub || 'https://agents.awpdemon.com';
 const TOKEN = args.token || '';
-const CLAUDE_CMD = args.claude || findClaude();
+const SSH_TARGET = args.ssh || ''; // e.g. "user@host" — run claude on remote machine via SSH
+const SSH_KEY = args['ssh-key'] || ''; // e.g. "/path/to/key"
+const CLAUDE_CMD = args.claude || (SSH_TARGET ? 'claude' : findClaude());
 
 if (!TOKEN) {
   console.error('Usage: node daemon.js --agent <name> --hub <url> --token <session-token>');
@@ -43,12 +45,14 @@ function findClaude() {
   }
 }
 
-// Verify claude works
-try {
-  execSync(`${CLAUDE_CMD} --version`, { encoding: 'utf8', timeout: 10000 });
-} catch {
-  console.error(`[${AGENT_NAME}] ERROR: Cannot find 'claude' command. Install Claude Code or pass --claude /path/to/claude`);
-  process.exit(1);
+// Verify claude works (skip for SSH — will fail on connect if broken)
+if (!SSH_TARGET) {
+  try {
+    execSync(`${CLAUDE_CMD} --version`, { encoding: 'utf8', timeout: 10000 });
+  } catch {
+    console.error(`[${AGENT_NAME}] ERROR: Cannot find 'claude' command. Install Claude Code or pass --claude /path/to/claude`);
+    process.exit(1);
+  }
 }
 
 // --- State ---
@@ -214,16 +218,26 @@ function drainQueue() {
 // --- Claude Code Execution ---
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const args = ['--dangerously-skip-permissions', '-p', prompt];
+    let cmd, cmdArgs;
 
-    if (lastConversationId) {
-      args.push('--resume', lastConversationId);
+    if (SSH_TARGET) {
+      // Run claude on remote machine via SSH
+      const escaped = prompt.replace(/"/g, '\\"');
+      const sshArgs = ['-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10'];
+      if (SSH_KEY) sshArgs.push('-i', SSH_KEY);
+      sshArgs.push(SSH_TARGET, `${CLAUDE_CMD} --dangerously-skip-permissions -p "${escaped}"`);
+      cmd = 'ssh';
+      cmdArgs = sshArgs;
+      console.log(`[${AGENT_NAME}] Running via SSH: claude -p "${prompt.substring(0, 60)}..."`);
+    } else {
+      // Run claude locally
+      cmdArgs = ['--dangerously-skip-permissions', '-p', prompt];
+      cmd = CLAUDE_CMD;
+      console.log(`[${AGENT_NAME}] Running: claude -p "${prompt.substring(0, 80)}..."`);
     }
 
-    console.log(`[${AGENT_NAME}] Running: claude -p "${prompt.substring(0, 80)}..."${lastConversationId ? ' (resuming)' : ''}`);
-
     // Key: stdin must be 'ignore' so Claude runs non-interactively
-    const proc = spawn(CLAUDE_CMD, args, {
+    const proc = spawn(cmd, cmdArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env }
     });
