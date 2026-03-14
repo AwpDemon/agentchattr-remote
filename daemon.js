@@ -2,17 +2,15 @@
 /**
  * agentchattr-remote — Remote agent daemon
  *
- * Runs on any device. Connects to a hub agentchattr instance.
+ * Connects to hub via WebSocket for real-time messaging.
  * Maintains one persistent Claude Code session.
- * When @mentioned in the chat, injects the message into the session.
- * Reports results back to the chat.
+ * When @mentioned, injects the task into the session.
  *
  * Usage:
  *   node daemon.js --agent awppc --hub https://agents.awpdemon.com --token <session-token>
- *   node daemon.js --agent awpmac --hub https://agents.awpdemon.com --token <session-token>
  */
 
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { platform } from 'os';
 
 // Parse CLI args
@@ -25,272 +23,200 @@ for (let i = 2; i < process.argv.length; i += 2) {
 const AGENT_NAME = args.agent || 'remote-agent';
 const HUB_URL = args.hub || 'https://agents.awpdemon.com';
 const TOKEN = args.token || '';
-const POLL_INTERVAL = parseInt(args.interval) || 3000;
 const CLAUDE_CMD = args.claude || 'claude';
 
 if (!TOKEN) {
   console.error('Usage: node daemon.js --agent <name> --hub <url> --token <session-token>');
-  console.error('');
-  console.error('Get the session token from the agentchattr startup output on the hub.');
   process.exit(1);
 }
 
+// Convert https to wss for WebSocket
+const WS_URL = HUB_URL.replace('https://', 'wss://').replace('http://', 'ws://') + `/ws?token=${TOKEN}`;
+
 // State
-let lastMessageId = 0;
+let ws = null;
 let claudeProcess = null;
 let claudeReady = false;
 let claudeOutput = '';
-let pendingPrompt = null;
 let processingTask = false;
+let reconnectAttempts = 0;
+let initialized = false; // Skip messages until we're caught up
+let taskQueue = [];
 
-const headers = {
-  'Content-Type': 'application/json',
-  'Cookie': `session_token=${TOKEN}`
-};
+// --- WebSocket Connection ---
+async function connectWs() {
+  const { default: WebSocket } = await import('ws');
 
-// --- Hub API ---
-async function hubFetch(path, options = {}) {
-  const url = `${HUB_URL}${path}`;
-  try {
-    const res = await fetch(url, { headers, ...options });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`${res.status}: ${text}`);
-    }
-    return res.json();
-  } catch (e) {
-    if (e.message.includes('fetch failed')) return null;
-    throw e;
-  }
-}
+  console.log(`[${AGENT_NAME}] Connecting to hub WebSocket...`);
 
-async function sendMessage(text, channel = 'general') {
-  return hubFetch('/api/messages', {
-    method: 'POST',
-    body: JSON.stringify({ sender: AGENT_NAME, text, channel })
-  });
-}
+  ws = new WebSocket(WS_URL);
 
-async function getMessages(since = 0) {
-  return hubFetch(`/api/messages?channel=general&since_id=${since}`);
-}
+  ws.on('open', () => {
+    console.log(`[${AGENT_NAME}] WebSocket connected!`);
+    reconnectAttempts = 0;
 
-async function register() {
-  return hubFetch('/api/register', {
-    method: 'POST',
-    body: JSON.stringify({ name: AGENT_NAME, label: AGENT_NAME })
-  });
-}
-
-async function heartbeat() {
-  return hubFetch(`/api/heartbeat/${AGENT_NAME}`, { method: 'POST' });
-}
-
-// --- Claude Code Session ---
-function startClaude() {
-  console.log(`[${AGENT_NAME}] Starting Claude Code session...`);
-
-  const isWindows = platform() === 'win32';
-  const cmd = isWindows ? `${CLAUDE_CMD}.cmd` : CLAUDE_CMD;
-
-  // Try to find claude
-  claudeProcess = spawn(cmd, ['--dangerously-skip-permissions', '--verbose'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    shell: true,
-    env: { ...process.env }
+    // Ignore all messages for the first 2 seconds (historical backfill)
+    initialized = false;
+    setTimeout(() => {
+      initialized = true;
+      console.log(`[${AGENT_NAME}] Ready — now listening for @mentions`);
+      // Announce presence
+      sendChat(`${AGENT_NAME} is online and ready.`);
+    }, 2000);
   });
 
-  claudeProcess.stdout.on('data', (data) => {
-    const text = data.toString();
-    claudeOutput += text;
-
-    // Detect when Claude is ready for input (shows the prompt)
-    if (text.includes('❯') || text.includes('>') || text.includes('Human:')) {
-      claudeReady = true;
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      handleMessage(msg);
+    } catch (e) {
+      // Ignore parse errors
     }
   });
 
-  claudeProcess.stderr.on('data', (data) => {
-    const text = data.toString();
-    // Claude Code outputs status info on stderr
-    if (text.includes('ready') || text.includes('Connected')) {
-      claudeReady = true;
-    }
+  ws.on('close', () => {
+    console.log(`[${AGENT_NAME}] WebSocket disconnected. Reconnecting...`);
+    reconnectAttempts++;
+    const delay = Math.min(reconnectAttempts * 2000, 30000);
+    setTimeout(connectWs, delay);
   });
 
-  claudeProcess.on('exit', (code) => {
-    console.log(`[${AGENT_NAME}] Claude Code exited with code ${code}. Restarting in 5s...`);
-    claudeReady = false;
-    claudeProcess = null;
-    setTimeout(startClaude, 5000);
-  });
-
-  claudeProcess.on('error', (err) => {
-    console.error(`[${AGENT_NAME}] Failed to start Claude:`, err.message);
-    console.log(`[${AGENT_NAME}] Retrying in 10s...`);
-    setTimeout(startClaude, 10000);
+  ws.on('error', (err) => {
+    console.error(`[${AGENT_NAME}] WebSocket error:`, err.message);
   });
 }
 
-function injectPrompt(text) {
-  if (!claudeProcess || !claudeProcess.stdin.writable) {
-    console.log(`[${AGENT_NAME}] Claude not ready, queuing prompt`);
-    pendingPrompt = text;
-    return false;
-  }
-
-  console.log(`[${AGENT_NAME}] Injecting: ${text.substring(0, 100)}...`);
-  claudeProcess.stdin.write(text + '\n');
-  return true;
-}
-
-// --- Collect Claude's response ---
-async function waitForResponse(timeoutMs = 120000) {
-  claudeOutput = '';
-  const start = Date.now();
-  let settled = 0;
-  let lastLen = 0;
-
-  return new Promise((resolve) => {
-    const check = setInterval(() => {
-      const elapsed = Date.now() - start;
-
-      // Check if output has stopped growing (settled for 3s)
-      if (claudeOutput.length > 0 && claudeOutput.length === lastLen) {
-        settled += 500;
-      } else {
-        settled = 0;
-      }
-      lastLen = claudeOutput.length;
-
-      if (settled >= 3000 || elapsed >= timeoutMs) {
-        clearInterval(check);
-        // Clean up ANSI codes and extract meaningful output
-        const clean = claudeOutput
-          .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-          .replace(/\r/g, '')
-          .trim();
-        resolve(clean || '(no output)');
-      }
-    }, 500);
-  });
-}
-
-// --- Message Processing ---
-function isForMe(msg) {
-  const text = msg.text || '';
-  const mentionsMe = text.toLowerCase().includes(`@${AGENT_NAME.toLowerCase()}`);
-  const mentionsAll = text.toLowerCase().includes('@all');
-  // Don't process my own messages or system messages
-  const isFromMe = msg.sender === AGENT_NAME;
-  const isSystem = msg.type === 'system' || msg.type === 'join';
-  return (mentionsMe || mentionsAll) && !isFromMe && !isSystem;
-}
-
-async function processMessage(msg) {
-  if (processingTask) {
-    console.log(`[${AGENT_NAME}] Already processing, skipping message ${msg.id}`);
+function sendChat(text, channel = 'general') {
+  if (!ws || ws.readyState !== 1) {
+    console.log(`[${AGENT_NAME}] WebSocket not ready, can't send`);
     return;
   }
+  ws.send(JSON.stringify({
+    type: 'message',
+    sender: AGENT_NAME,
+    text,
+    channel
+  }));
+}
 
+// --- Message Handling ---
+function handleMessage(msg) {
+  // agentchattr broadcasts: {"type": "message", "data": {id, sender, text, type, channel}}
+  if (msg.type === 'message' && msg.data) {
+    // Skip our own messages to prevent loops
+    if (msg.data.sender === AGENT_NAME) return;
+    checkMention(msg.data);
+    return;
+  }
+}
+
+function checkMention(msg) {
+  if (!msg || !msg.text) return;
+  if (!initialized) return; // Skip historical messages
+
+  const text = msg.text.toLowerCase();
+  const sender = msg.sender || '';
+
+  // Don't process own messages or system messages
+  if (sender === AGENT_NAME) return;
+  if (msg.type === 'system' || msg.type === 'join' || msg.type === 'leave') return;
+
+  // Check if @mentioned
+  const mentionsMe = text.includes(`@${AGENT_NAME.toLowerCase()}`);
+  const mentionsAll = text.includes('@all');
+
+  if (mentionsMe || mentionsAll) {
+    console.log(`[${AGENT_NAME}] Mentioned by ${sender}: ${msg.text.substring(0, 100)}`);
+    if (processingTask) {
+      taskQueue.push(msg);
+      sendChat(`📋 Queued (${taskQueue.length} in queue). Still working on current task.`);
+    } else {
+      processTask(msg);
+    }
+  }
+}
+
+async function processTask(msg) {
   processingTask = true;
-  const task = msg.text.replace(new RegExp(`@${AGENT_NAME}\\s*`, 'gi'), '').trim();
+  const task = msg.text
+    .replace(new RegExp(`@${AGENT_NAME}\\s*`, 'gi'), '')
+    .replace(/@all\s*/gi, '')
+    .trim();
 
-  console.log(`[${AGENT_NAME}] Processing: "${task}" from ${msg.sender}`);
-  await sendMessage(`🔄 Working on it: "${task.substring(0, 100)}"`);
+  sendChat(`🔄 Working on: "${task.substring(0, 150)}"`);
 
-  // Inject into Claude
-  const injected = injectPrompt(task);
-  if (!injected) {
-    await sendMessage(`⚠️ Claude session not ready. Task queued.`);
-    pendingPrompt = task;
-    processingTask = false;
-    return;
-  }
-
-  // Wait for response
-  const response = await waitForResponse();
-
-  // Truncate if too long for chat
-  const maxLen = 2000;
-  const truncated = response.length > maxLen
-    ? response.substring(0, maxLen) + '\n\n... (truncated)'
-    : response;
-
-  await sendMessage(`✅ Done.\n\n${truncated}`);
-  processingTask = false;
-}
-
-// --- Main Loop ---
-async function pollMessages() {
   try {
-    const data = await getMessages(lastMessageId);
-    if (!data || !data.messages) return;
+    const response = await runClaude(task);
 
-    for (const msg of data.messages) {
-      if (msg.id <= lastMessageId) continue;
-      lastMessageId = msg.id;
+    // Send result back (truncate if needed)
+    const maxLen = 3000;
+    const result = response.length > maxLen
+      ? response.substring(0, maxLen) + '\n\n... (truncated)'
+      : response;
 
-      if (isForMe(msg)) {
-        await processMessage(msg);
-      }
-    }
-  } catch (e) {
-    // Silently retry on network errors
+    sendChat(`✅ Done.\n\n${result}`);
+  } catch (err) {
+    sendChat(`❌ Error: ${err.message}`);
+  }
+
+  processingTask = false;
+
+  // Process next queued task
+  if (taskQueue.length > 0) {
+    const next = taskQueue.shift();
+    console.log(`[${AGENT_NAME}] Processing next queued task (${taskQueue.length} remaining)`);
+    processTask(next);
   }
 }
 
+// --- Claude Code Execution ---
+// Uses `claude -p` (print mode) for each task — returns clean output
+let conversationId = null; // Reuse conversation for context continuity
+
+async function runClaude(prompt) {
+  // Escape the prompt for shell use
+  const escaped = prompt.replace(/"/g, '\\"');
+  const cmd = `${CLAUDE_CMD} --dangerously-skip-permissions -p "${escaped}"`;
+
+  console.log(`[${AGENT_NAME}] Running: ${cmd.substring(0, 100)}...`);
+
+  try {
+    const output = execSync(cmd, {
+      encoding: 'utf8',
+      timeout: 300000, // 5 min
+      maxBuffer: 10 * 1024 * 1024, // 10MB
+      env: { ...process.env }
+    });
+    return output.trim() || '(completed with no text output)';
+  } catch (err) {
+    if (err.stdout) return err.stdout.trim();
+    if (err.stderr) return err.stderr.trim();
+    throw err;
+  }
+}
+
+function startClaude() {
+  // No persistent session needed — we use claude -p per task
+  claudeReady = true;
+  console.log(`[${AGENT_NAME}] Claude Code ready (print mode)`);
+}
+
+// --- Main ---
 async function main() {
   console.log(`
   ╔═══════════════════════════════════════╗
   ║     agentchattr remote daemon         ║
   ╠═══════════════════════════════════════╣
   ║  Agent:  ${AGENT_NAME.padEnd(28)}║
-  ║  Hub:    ${HUB_URL.padEnd(28).substring(0, 28)}║
-  ║  Poll:   ${(POLL_INTERVAL + 'ms').padEnd(28)}║
+  ║  Hub:    ${HUB_URL.substring(0, 28).padEnd(28)}║
   ╚═══════════════════════════════════════╝
   `);
 
-  // Register with hub
-  console.log(`[${AGENT_NAME}] Registering with hub...`);
-  const reg = await register();
-  if (reg) {
-    console.log(`[${AGENT_NAME}] Registered successfully`);
-  } else {
-    console.error(`[${AGENT_NAME}] Registration failed — check token and hub URL`);
-  }
-
-  // Get current message ID to avoid processing old messages
-  const initial = await getMessages(0);
-  if (initial && initial.messages && initial.messages.length > 0) {
-    lastMessageId = initial.messages[initial.messages.length - 1].id;
-    console.log(`[${AGENT_NAME}] Caught up to message #${lastMessageId}`);
-  }
-
-  // Start Claude Code session
+  // Start Claude Code
   startClaude();
 
-  // Announce presence
-  setTimeout(async () => {
-    await sendMessage(`${AGENT_NAME} is online and ready for tasks.`);
-  }, 3000);
-
-  // Poll for messages
-  setInterval(pollMessages, POLL_INTERVAL);
-
-  // Heartbeat every 30s
-  setInterval(heartbeat, 30000);
-
-  // Process pending prompts when Claude becomes ready
-  setInterval(() => {
-    if (claudeReady && pendingPrompt) {
-      const prompt = pendingPrompt;
-      pendingPrompt = null;
-      injectPrompt(prompt);
-    }
-  }, 1000);
-
-  console.log(`[${AGENT_NAME}] Polling for @mentions every ${POLL_INTERVAL}ms...`);
+  // Connect WebSocket (real-time, no polling)
+  await connectWs();
 }
 
 main().catch(console.error);
