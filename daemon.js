@@ -10,7 +10,7 @@
  *   node daemon.js --agent awppc --hub https://agents.awpdemon.com --token <session-token>
  */
 
-import { execSync, exec } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -109,6 +109,8 @@ async function connectWs() {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'message' && msg.data) {
+        // Skip own messages immediately to prevent any echo/loop
+        if (msg.data.sender === AGENT_NAME) return;
         onMessage(msg.data);
       }
     } catch {}
@@ -212,39 +214,45 @@ function drainQueue() {
 // --- Claude Code Execution ---
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
-    // Build command — use --resume if we have a previous conversation
-    const escaped = prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/`/g, '\\`');
-    let cmd = `${CLAUDE_CMD} --dangerously-skip-permissions -p "${escaped}"`;
+    const args = ['--dangerously-skip-permissions', '-p', prompt];
 
     if (lastConversationId) {
-      cmd += ` --resume "${lastConversationId}"`;
+      args.push('--resume', lastConversationId);
     }
 
-    console.log(`[${AGENT_NAME}] Exec: claude -p "${prompt.substring(0, 80)}..."${lastConversationId ? ' (resuming)' : ''}`);
+    console.log(`[${AGENT_NAME}] Running: claude -p "${prompt.substring(0, 80)}..."${lastConversationId ? ' (resuming)' : ''}`);
 
-    exec(cmd, {
-      encoding: 'utf8',
-      timeout: 300000, // 5 min
-      maxBuffer: 10 * 1024 * 1024,
+    // Key: stdin must be 'ignore' so Claude runs non-interactively
+    const proc = spawn(CLAUDE_CMD, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env }
-    }, (err, stdout, stderr) => {
-      // Try to capture conversation ID from output for continuity
-      const idMatch = (stderr || '').match(/session[_\s]*id[:\s]+([a-f0-9-]+)/i)
-        || (stdout || '').match(/session[_\s]*id[:\s]+([a-f0-9-]+)/i);
-      if (idMatch) saveConversationId(idMatch[1]);
+    });
 
-      if (err) {
-        // Claude -p exits non-zero sometimes but still has output
-        const output = (stdout || '').trim() || (stderr || '').trim();
-        if (output) {
-          resolve(output);
-        } else {
-          reject(new Error(err.message.substring(0, 200)));
-        }
-        return;
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+
+    const timeout = setTimeout(() => {
+      proc.kill();
+      reject(new Error('Timed out after 5 minutes'));
+    }, 300000);
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      const output = stdout.trim() || stderr.trim();
+      if (output) {
+        resolve(output);
+      } else if (code !== 0) {
+        reject(new Error(`Claude exited with code ${code}`));
+      } else {
+        resolve('(completed)');
       }
+    });
 
-      resolve((stdout || '').trim() || '(completed)');
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(err);
     });
   });
 }
