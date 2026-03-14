@@ -140,6 +140,9 @@ function sendChat(text, channel = 'general') {
 }
 
 // --- Message Processing ---
+const AGENT_NAMES = new Set(); // Track all known agent names to detect loops
+const recentAgentChains = new Map(); // Track agent→agent response chains to prevent loops
+
 function onMessage(msg) {
   if (!initialized) return;
   if (!msg || !msg.text || !msg.id) return;
@@ -147,22 +150,40 @@ function onMessage(msg) {
   // Deduplication — never process the same message ID twice
   if (processedIds.has(msg.id)) return;
   processedIds.add(msg.id);
-  // Keep set from growing forever
   if (processedIds.size > 500) {
     const arr = [...processedIds];
     processedIds = new Set(arr.slice(-250));
   }
 
-  // Skip own messages, system messages
+  // Skip own messages, system messages, status messages
   if (msg.sender === AGENT_NAME) return;
   if (['system', 'join', 'leave'].includes(msg.type)) return;
 
-  // Check for @mention
+  // Track known agents
+  AGENT_NAMES.add(msg.sender);
+
   const text = msg.text.toLowerCase();
   const mentionsMe = text.includes(`@${AGENT_NAME.toLowerCase()}`);
-  const mentionsAll = text.includes('@all');
+
+  // Only respond to @all from humans (user/web-ui), not from other agents
+  const mentionsAll = text.includes('@all') && !AGENT_NAMES.has(msg.sender);
 
   if (!mentionsMe && !mentionsAll) return;
+
+  // Loop breaker: ignore status messages from daemons
+  if (msg.text.startsWith('🔄') || msg.text.startsWith('✅') || msg.text.startsWith('❌') || msg.text.startsWith('📋')) return;
+
+  // Loop breaker: if another agent mentions us, respond ONCE then stop.
+  // Track senders we've already responded to in the last 60 seconds.
+  if (AGENT_NAMES.has(msg.sender) && msg.sender !== 'user' && msg.sender !== 'web-ui') {
+    const key = `${msg.sender}->${AGENT_NAME}`;
+    const now = Date.now();
+    if (recentAgentChains.has(key) && now - recentAgentChains.get(key) < 60000) {
+      console.log(`[${AGENT_NAME}] Skipping — already responded to ${msg.sender} recently (loop prevention)`);
+      return;
+    }
+    recentAgentChains.set(key, now);
+  }
 
   console.log(`[${AGENT_NAME}] @${msg.sender}: ${msg.text.substring(0, 120)}`);
 
@@ -178,17 +199,23 @@ async function runTask(msg) {
   processingTask = true;
 
   // Strip @mentions from the prompt
-  const prompt = msg.text
+  const task = msg.text
     .replace(new RegExp(`@${AGENT_NAME}`, 'gi'), '')
     .replace(/@all/gi, '')
     .trim();
 
-  if (!prompt) {
+  if (!task) {
     sendChat(`⚠️ Empty task after removing @mentions.`);
     processingTask = false;
     drainQueue();
     return;
   }
+
+  // Prepend identity context so Claude knows who it is
+  const prompt = `You are ${AGENT_NAME}, an AI agent in a multi-device collaboration system. ` +
+    `You are running on ${SSH_TARGET ? `a remote machine (${SSH_TARGET})` : 'the local hub server'}. ` +
+    `${msg.sender} asked you: ${task}\n\n` +
+    `Respond concisely. If the task requires work on another device, mention @awphub or @awppc to delegate.`;
 
   sendChat(`🔄 Working on it...`);
 
